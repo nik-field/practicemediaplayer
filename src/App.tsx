@@ -44,6 +44,49 @@ const INITIAL_STATE: PlayerState = {
   isBuffering: false,
 };
 
+interface ErrorBoundaryProps {
+  children: React.ReactNode;
+}
+
+interface ErrorBoundaryState {
+  hasError: boolean;
+}
+
+// Error Boundary Component
+class ErrorBoundary extends React.Component<any, any> {
+  constructor(props: any) {
+    super(props);
+    (this as any).state = { hasError: false };
+  }
+
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+
+  componentDidCatch(error: any, errorInfo: any) {
+    console.error('ErrorBoundary caught an error:', error, errorInfo);
+  }
+
+  render() {
+    if ((this as any).state.hasError) {
+      return (
+        <div className="flex flex-col items-center justify-center min-h-screen bg-slate-950 text-white p-6 text-center">
+          <h1 className="text-2xl font-bold mb-4">Something went wrong.</h1>
+          <p className="text-slate-400 mb-6">The application encountered an unexpected error.</p>
+          <button 
+            onClick={() => window.location.reload()}
+            className="px-6 py-2 bg-indigo-600 hover:bg-indigo-500 rounded-xl transition-colors"
+          >
+            Reload App
+          </button>
+        </div>
+      );
+    }
+
+    return (this as any).props.children;
+  }
+}
+
 export default function App() {
   const [state, setState] = useState<PlayerState>(INITIAL_STATE);
   const [youtubeUrl, setYoutubeUrl] = useState('');
@@ -328,38 +371,77 @@ export default function App() {
 
   // YouTube Player Initialization and Control
   useEffect(() => {
+    console.log('YouTube useEffect triggered:', { 
+      mediaType: state.mediaType, 
+      mediaUrl: state.mediaUrl, 
+      containerExists: !!youtubeContainerRef.current,
+      playerExists: !!youtubePlayerRef.current
+    });
+
     if (state.mediaType !== 'youtube' || !state.mediaUrl || !youtubeContainerRef.current) {
       if (youtubePlayerRef.current) {
-        youtubePlayerRef.current.destroy();
+        console.log('YouTube: Cleaning up player (not youtube, no url, or no container)');
+        try {
+          youtubePlayerRef.current.destroy();
+        } catch (e) {
+          console.warn('Error destroying YouTube player in cleanup:', e);
+        }
         youtubePlayerRef.current = null;
       }
       return;
     }
 
     // Extract video ID
-    const videoId = state.mediaUrl.match(/(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/)?.[1];
-    if (!videoId) return;
+    const youtubeRegex = /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?|shorts)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/;
+    const match = state.mediaUrl.match(youtubeRegex);
+    const videoId = match?.[1];
+    
+    if (!videoId) {
+      console.error('YouTube: Could not extract video ID in useEffect for URL:', state.mediaUrl);
+      return;
+    }
 
     if (!youtubePlayerRef.current) {
-      console.log('YouTube: Initializing player for', videoId);
-      youtubePlayerRef.current = createPlayer(youtubeContainerRef.current, {
-        videoId,
-        playerVars: {
-          autoplay: 0,
-          modestbranding: 1,
-          rel: 0,
-          showinfo: 0,
-          iv_load_policy: 3,
-          playsinline: 1
-        }
-      });
+      console.log('YouTube: Initializing player for ID:', videoId);
+      try {
+        youtubePlayerRef.current = createPlayer(youtubeContainerRef.current, {
+          videoId,
+          playerVars: {
+            autoplay: 0,
+            modestbranding: 1,
+            rel: 0,
+            showinfo: 0,
+            iv_load_policy: 3,
+            playsinline: 1
+          }
+        });
+      } catch (e) {
+        console.error('YouTube: Failed to create player instance:', e);
+        return;
+      }
 
       youtubePlayerRef.current.on('ready', async () => {
         const duration = await youtubePlayerRef.current.getDuration();
-        console.log('YouTube: Player Ready', { duration });
+        let title = 'YouTube Video';
+        
+        try {
+          // Use noembed.com to get the title (has CORS headers)
+          const response = await fetch(`https://noembed.com/embed?url=https://www.youtube.com/watch?v=${videoId}`);
+          if (response.ok) {
+            const data = await response.json();
+            if (data && data.title) {
+              title = data.title;
+            }
+          }
+        } catch (e) {
+          console.warn('Could not fetch YouTube title via noembed:', e);
+        }
+        
+        console.log('YouTube: Player Ready', { duration, title });
         setState(prev => ({
           ...prev,
           duration,
+          fileName: title,
           clipEnd: prev.clipEnd === null ? duration : prev.clipEnd,
           isReady: true,
           isBuffering: false
@@ -442,6 +524,16 @@ export default function App() {
 
   // Handle Media Loading
   const loadLocalFile = (file: File) => {
+    // Explicitly destroy YouTube player if it exists to prevent DOM conflicts during unmounting
+    if (youtubePlayerRef.current) {
+      try {
+        youtubePlayerRef.current.destroy();
+      } catch (e) {
+        console.warn('Error destroying YouTube player:', e);
+      }
+      youtubePlayerRef.current = null;
+    }
+
     if (wavesurferRef.current) wavesurferRef.current.pause();
     
     const url = URL.createObjectURL(file);
@@ -456,15 +548,56 @@ export default function App() {
   };
 
   const loadYoutube = () => {
-    const isYoutube = /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/.test(youtubeUrl);
-    if (isYoutube) {
+    const url = youtubeUrl.trim();
+    console.log('YouTube: loadYoutube called with URL:', url);
+    
+    if (!url) {
+      console.log('YouTube: Empty URL, ignoring');
+      return;
+    }
+
+    // More robust regex including shorts support
+    const youtubeRegex = /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?|shorts)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/;
+    const match = url.match(youtubeRegex);
+    const videoId = match?.[1];
+
+    if (videoId) {
+      console.log('YouTube: Valid video ID found:', videoId);
+      
+      // If it's the same URL, we don't need to destroy and recreate everything
+      // but we should probably just let the useEffect handle it if we change state.
+      // However, to be safe and force a refresh if needed:
+      if (state.mediaUrl === url && state.mediaType === 'youtube') {
+        console.log('YouTube: Same URL already loaded, re-cueing video');
+        if (youtubePlayerRef.current) {
+          youtubePlayerRef.current.cueVideoById(videoId);
+          return;
+        }
+      }
+
+      // Explicitly destroy existing YouTube player if it exists and we're changing media
+      if (youtubePlayerRef.current) {
+        console.log('YouTube: Destroying existing player');
+        try {
+          youtubePlayerRef.current.destroy();
+        } catch (e) {
+          console.warn('Error destroying existing YouTube player:', e);
+        }
+        youtubePlayerRef.current = null;
+      }
+
       const newState = { 
         ...INITIAL_STATE, 
-        mediaUrl: youtubeUrl, 
+        mediaUrl: url, 
         mediaType: 'youtube' as any, 
         fileName: 'YouTube Video' 
       };
+      console.log('YouTube: Setting new state:', newState);
       setState(newState);
+      setYoutubeUrl(''); // Clear input after successful load
+    } else {
+      console.warn('YouTube: Could not extract video ID from URL:', url);
+      alert('Invalid YouTube URL. Please check the link and try again.');
     }
   };
 
@@ -826,7 +959,8 @@ export default function App() {
   }, [state.isPlaying, state.playbackRate, state.pitch, state.volume]);
 
   return (
-    <div className="min-h-screen bg-[#0a0a0a] text-white font-sans selection:bg-indigo-500/30 relative">
+    <ErrorBoundary>
+      <div className="min-h-screen bg-[#0a0a0a] text-white font-sans selection:bg-indigo-500/30 relative">
       {/* Global Drag Overlay */}
       <AnimatePresence>
         {isDragging && (
@@ -866,11 +1000,18 @@ export default function App() {
               </span>
               <button 
                 onClick={() => {
-                  if (wavesurferRef.current) wavesurferRef.current.pause();
+                  if (youtubePlayerRef.current) {
+                    try {
+                      youtubePlayerRef.current.destroy();
+                    } catch (e) {
+                      console.warn('Error destroying YouTube player on close:', e);
+                    }
+                    youtubePlayerRef.current = null;
+                  }
                   setState(INITIAL_STATE);
                 }}
                 className="p-0.5 hover:bg-white/10 rounded-full transition-colors opacity-0 group-hover:opacity-100"
-                title="Close Media"
+                title="Unload Media"
               >
                 <X size={14} className="text-white/50 hover:text-white" />
               </button>
@@ -879,17 +1020,18 @@ export default function App() {
 
           <button 
             onClick={() => {
-              const input = document.createElement('input');
-              input.type = 'file';
-              input.accept = 'audio/*,video/*';
-              input.onchange = (e) => {
-                const file = (e.target as HTMLInputElement).files?.[0];
-                if (file) loadLocalFile(file);
-              };
-              input.click();
+              if (youtubePlayerRef.current) {
+                try {
+                  youtubePlayerRef.current.destroy();
+                } catch (e) {
+                  console.warn('Error destroying YouTube player on reset:', e);
+                }
+                youtubePlayerRef.current = null;
+              }
+              setState(INITIAL_STATE);
             }}
             className="p-2 hover:bg-white/5 rounded-lg transition-colors text-white/70 hover:text-white"
-            title="Load New File"
+            title="Unload Media"
           >
             <Plus size={20} />
           </button>
@@ -949,9 +1091,19 @@ export default function App() {
                 className="flex-1 bg-transparent border-none focus:ring-0 px-4 text-sm"
                 value={youtubeUrl}
                 onChange={(e) => setYoutubeUrl(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    loadYoutube();
+                  }
+                }}
               />
               <button 
-                onClick={loadYoutube}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  console.log('YouTube: Load button clicked');
+                  loadYoutube();
+                }}
                 className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 rounded-xl text-sm font-medium transition-colors"
               >
                 Load
@@ -1715,6 +1867,7 @@ export default function App() {
         .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
       `}} />
     </div>
+    </ErrorBoundary>
   );
 }
 

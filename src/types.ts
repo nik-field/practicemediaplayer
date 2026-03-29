@@ -13,4 +13,7 @@ export type PlayerState = {
   mediaUrl: string | null;
   mediaType: 'audio' | 'video' | 'youtube' | null;
   fileName: string | null;
+  loopDelay: number;
+  isReady: boolean;
+  isBuffering: boolean;
 };

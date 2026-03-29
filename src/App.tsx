@@ -4,7 +4,7 @@
  */
 
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import ReactPlayer from 'react-player';
+import createPlayer from 'youtube-player';
 import WaveSurfer from 'wavesurfer.js';
 import * as Tone from 'tone';
 import { 
@@ -39,6 +39,9 @@ const INITIAL_STATE: PlayerState = {
   mediaUrl: null,
   mediaType: null,
   fileName: null,
+  loopDelay: 0,
+  isReady: false,
+  isBuffering: false,
 };
 
 export default function App() {
@@ -54,10 +57,15 @@ export default function App() {
   const [selectionStart, setSelectionStart] = useState<number | null>(null);
   const [hoverTime, setHoverTime] = useState<number | null>(null);
 
-  const playerRef = useRef<any>(null);
+  const youtubePlayerRef = useRef<any>(null);
+  const youtubeContainerRef = useRef<HTMLDivElement>(null);
+  const youtubeIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const wavesurferRef = useRef<WaveSurfer | null>(null);
   const waveformContainerRef = useRef<HTMLDivElement>(null);
+  const isDelaying = useRef(false);
+  const isProgrammaticPause = useRef(false);
+  const loopTimeoutRef = useRef<any>(null);
   const pitchShiftRef = useRef<any>(null);
   const toneSourceRef = useRef<any>(null);
   const mouseDownRef = useRef<{ x: number; time: number } | null>(null);
@@ -68,6 +76,32 @@ export default function App() {
   const lastArrowTap = useRef<{ [key: string]: number }>({ ArrowLeft: 0, ArrowRight: 0 });
   const arrowTimer = useRef<{ [key: string]: NodeJS.Timeout | null }>({ ArrowLeft: null, ArrowRight: null });
   const lastValidCycle = useRef<{ start: number | null, end: number | null, isLooping: boolean } | null>(null);
+
+  // Helper for safe seekTo calls
+  const safeSeekTo = useCallback((time: number) => {
+    // YouTube
+    if (state.mediaType === 'youtube' && youtubePlayerRef.current) {
+      try {
+        youtubePlayerRef.current.seekTo(time, true);
+      } catch (e) {
+        console.warn('YouTube safeSeekTo failed:', e);
+      }
+    }
+    
+    // Local Video (only if not using WaveSurfer for seeking)
+    if (videoRef.current && state.mediaType === 'video' && !wavesurferRef.current) {
+      videoRef.current.currentTime = time;
+    }
+    
+    // WaveSurfer (Audio and Waveform visualization)
+    if (wavesurferRef.current) {
+      try {
+        wavesurferRef.current.setTime(time);
+      } catch (e) {
+        // Ignore errors if wavesurfer is not ready
+      }
+    }
+  }, [state.mediaType]);
 
   // Global Drag and Drop Handlers
   useEffect(() => {
@@ -147,8 +181,20 @@ export default function App() {
       media: state.mediaType === 'video' ? videoRef.current || undefined : undefined,
     });
 
+    ws.on('error', (err) => {
+      // Suppress "aborted" errors which are common when switching tracks
+      if (err.message?.includes('aborted') || err.name === 'AbortError') return;
+      console.error('WaveSurfer error:', err);
+      setState(prev => ({ ...prev, isReady: false, isBuffering: false }));
+    });
+
     ws.on('ready', () => {
-      setState(prev => ({ ...prev, duration: ws.getDuration(), clipEnd: prev.clipEnd === null ? ws.getDuration() : prev.clipEnd }));
+      setState(prev => ({ 
+        ...prev, 
+        duration: ws.getDuration(), 
+        clipEnd: prev.clipEnd === null ? ws.getDuration() : prev.clipEnd,
+        isReady: true 
+      }));
       
       // Initialize Tone.js for pitch shifting (only for local files)
       if (state.mediaType !== 'youtube') {
@@ -183,6 +229,7 @@ export default function App() {
     });
 
     return () => {
+      if (loopTimeoutRef.current) clearTimeout(loopTimeoutRef.current);
       ws.destroy();
       if (pitchShiftRef.current) {
         try {
@@ -205,27 +252,193 @@ export default function App() {
   }, [state.mediaUrl, state.mediaType]);
 
   // Handle Looping and Clip End Logic
+  const checkLoop = useCallback((time: number) => {
+    if (isDelaying.current) return;
+
+    if (state.isLooping && state.cycleStart !== null && state.cycleEnd !== null) {
+      if (time >= state.cycleEnd) {
+        if (state.loopDelay > 0) {
+          isDelaying.current = true;
+          isProgrammaticPause.current = true;
+          // Pause all
+          if (wavesurferRef.current) wavesurferRef.current.pause();
+          if (videoRef.current && state.mediaType === 'video' && !wavesurferRef.current) {
+            videoRef.current.pause();
+          }
+          if (state.mediaType === 'youtube' && youtubePlayerRef.current) {
+            youtubePlayerRef.current.pauseVideo();
+          }
+          
+          if (loopTimeoutRef.current) clearTimeout(loopTimeoutRef.current);
+          loopTimeoutRef.current = setTimeout(() => {
+            const targetTime = state.cycleStart!;
+            safeSeekTo(targetTime);
+            
+            if (state.isPlaying) {
+              if (wavesurferRef.current) {
+                wavesurferRef.current.play().catch(() => {});
+              } else if (videoRef.current && state.mediaType === 'video') {
+                videoRef.current.play().catch(() => {});
+              }
+              
+              if (state.mediaType === 'youtube' && youtubePlayerRef.current) {
+                youtubePlayerRef.current.playVideo();
+              }
+            }
+
+            // Cooldown period to ensure the player has actually moved away from the end point
+            // and won't immediately re-trigger the loop check.
+            setTimeout(() => {
+              isDelaying.current = false;
+              isProgrammaticPause.current = false;
+            }, 250);
+          }, state.loopDelay * 1000);
+          return;
+        } else {
+          const targetTime = state.cycleStart;
+          isDelaying.current = true;
+          safeSeekTo(targetTime);
+          setTimeout(() => {
+            isDelaying.current = false;
+          }, 250);
+        }
+      }
+    }
+    
+    if (state.clipEnd !== null && time >= state.clipEnd) {
+      if (wavesurferRef.current) wavesurferRef.current.pause();
+      if (videoRef.current) videoRef.current.pause();
+      if (state.mediaType === 'youtube' && youtubePlayerRef.current) {
+        youtubePlayerRef.current.pauseVideo();
+      }
+      
+      const targetTime = state.clipStart;
+      safeSeekTo(targetTime);
+      
+      setState(prev => ({ ...prev, isPlaying: false }));
+    }
+  }, [state.isLooping, state.cycleStart, state.cycleEnd, state.clipEnd, state.clipStart, state.loopDelay, state.isPlaying]);
+
   useEffect(() => {
     if (!wavesurferRef.current) return;
     const ws = wavesurferRef.current;
-
-    const checkLoop = (time: number) => {
-      if (state.isLooping && state.cycleStart !== null && state.cycleEnd !== null) {
-        if (time >= state.cycleEnd) {
-          ws.setTime(state.cycleStart);
-        }
-      }
-      
-      if (state.clipEnd !== null && time >= state.clipEnd) {
-        ws.pause();
-        ws.setTime(state.clipStart);
-        setState(prev => ({ ...prev, isPlaying: false }));
-      }
-    };
-
     const unsubscribe = ws.on('timeupdate', checkLoop);
     return () => unsubscribe();
-  }, [state.isLooping, state.cycleStart, state.cycleEnd, state.clipEnd, state.clipStart]);
+  }, [checkLoop]);
+
+  // YouTube Player Initialization and Control
+  useEffect(() => {
+    if (state.mediaType !== 'youtube' || !state.mediaUrl || !youtubeContainerRef.current) {
+      if (youtubePlayerRef.current) {
+        youtubePlayerRef.current.destroy();
+        youtubePlayerRef.current = null;
+      }
+      return;
+    }
+
+    // Extract video ID
+    const videoId = state.mediaUrl.match(/(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/)?.[1];
+    if (!videoId) return;
+
+    if (!youtubePlayerRef.current) {
+      console.log('YouTube: Initializing player for', videoId);
+      youtubePlayerRef.current = createPlayer(youtubeContainerRef.current, {
+        videoId,
+        playerVars: {
+          autoplay: 0,
+          modestbranding: 1,
+          rel: 0,
+          showinfo: 0,
+          iv_load_policy: 3,
+          playsinline: 1
+        }
+      });
+
+      youtubePlayerRef.current.on('ready', async () => {
+        const duration = await youtubePlayerRef.current.getDuration();
+        console.log('YouTube: Player Ready', { duration });
+        setState(prev => ({
+          ...prev,
+          duration,
+          clipEnd: prev.clipEnd === null ? duration : prev.clipEnd,
+          isReady: true,
+          isBuffering: false
+        }));
+      });
+
+      youtubePlayerRef.current.on('stateChange', (event: any) => {
+        // -1 (unstarted), 0 (ended), 1 (playing), 2 (paused), 3 (buffering), 5 (video cued)
+        const s = event.data;
+        console.log('YouTube State Change:', s);
+        if (s === 1) {
+          setState(prev => ({ ...prev, isPlaying: true, isBuffering: false }));
+        } else if (s === 2) {
+          setState(prev => ({ ...prev, isPlaying: false }));
+        } else if (s === 3) {
+          setState(prev => ({ ...prev, isBuffering: true }));
+        } else if (s === 0) {
+          setState(prev => ({ ...prev, isPlaying: false }));
+        }
+      });
+
+      youtubePlayerRef.current.on('error', (e: any) => {
+        console.error('YouTube Player Error:', e);
+        setState(prev => ({ ...prev, isBuffering: false, isReady: false }));
+      });
+    } else {
+      console.log('YouTube: Loading video ID', videoId);
+      youtubePlayerRef.current.loadVideoById(videoId);
+    }
+
+    return () => {
+      if (youtubePlayerRef.current) {
+        console.log('YouTube: Destroying player');
+        youtubePlayerRef.current.destroy();
+        youtubePlayerRef.current = null;
+      }
+    };
+  }, [state.mediaUrl, state.mediaType]);
+
+  // Sync YouTube state
+  useEffect(() => {
+    if (state.mediaType === 'youtube' && youtubePlayerRef.current && state.isReady) {
+      if (state.isPlaying) {
+        youtubePlayerRef.current.playVideo();
+      } else {
+        youtubePlayerRef.current.pauseVideo();
+      }
+      youtubePlayerRef.current.setPlaybackRate(state.playbackRate);
+      youtubePlayerRef.current.setVolume(state.volume * 100);
+    }
+  }, [state.isPlaying, state.playbackRate, state.volume, state.isReady, state.mediaType]);
+
+  // Polling for YouTube progress
+  useEffect(() => {
+    if (state.mediaType === 'youtube' && state.isPlaying && state.isReady) {
+      if (youtubeIntervalRef.current) clearInterval(youtubeIntervalRef.current);
+      youtubeIntervalRef.current = setInterval(async () => {
+        if (youtubePlayerRef.current) {
+          try {
+            const time = await youtubePlayerRef.current.getCurrentTime();
+            setState(prev => ({ ...prev, currentTime: time }));
+            checkLoop(time);
+          } catch (e) {
+            // Ignore errors during polling
+          }
+        }
+      }, 50);
+    } else {
+      if (youtubeIntervalRef.current) {
+        clearInterval(youtubeIntervalRef.current);
+        youtubeIntervalRef.current = null;
+      }
+    }
+    return () => {
+      if (youtubeIntervalRef.current) {
+        clearInterval(youtubeIntervalRef.current);
+      }
+    };
+  }, [state.isPlaying, state.isReady, state.mediaType, checkLoop]);
 
   // Handle Media Loading
   const loadLocalFile = (file: File) => {
@@ -243,7 +456,8 @@ export default function App() {
   };
 
   const loadYoutube = () => {
-    if (ReactPlayer.canPlay(youtubeUrl)) {
+    const isYoutube = /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/.test(youtubeUrl);
+    if (isYoutube) {
       const newState = { 
         ...INITIAL_STATE, 
         mediaUrl: youtubeUrl, 
@@ -253,8 +467,6 @@ export default function App() {
       setState(newState);
     }
   };
-
-  const Player = ReactPlayer as any;
 
   // Keyboard Shortcuts
   useEffect(() => {
@@ -297,8 +509,7 @@ export default function App() {
                   }
                   if (prev.currentTime < lowerBound) {
                     nextTime = lowerBound;
-                    if (wavesurferRef.current) wavesurferRef.current.setTime(nextTime);
-                    if (playerRef.current) playerRef.current.seekTo(nextTime);
+                    safeSeekTo(nextTime);
                   }
                 }
                 
@@ -313,15 +524,14 @@ export default function App() {
       if (e.code === 'Enter') {
         e.preventDefault();
         const targetTime = state.isLooping && state.cycleStart !== null ? state.cycleStart : state.clipStart;
-        if (wavesurferRef.current) wavesurferRef.current.setTime(targetTime);
-        if (playerRef.current) playerRef.current.seekTo(targetTime);
+        safeSeekTo(targetTime);
       }
 
       if (e.code === 'ArrowLeft' || e.code === 'ArrowRight') {
         e.preventDefault();
         const key = e.code;
         const now = Date.now();
-        const isDoubleTap = now - lastArrowTap.current[key] < 300;
+        const isDoubleTap = now - lastArrowTap.current[key] < 250;
         
         if (arrowTimer.current[key]) {
           clearTimeout(arrowTimer.current[key]!);
@@ -344,8 +554,7 @@ export default function App() {
             newTime = Math.min(state.clipEnd || state.duration, newTime);
           }
           
-          if (wavesurferRef.current) wavesurferRef.current.setTime(newTime);
-          if (playerRef.current) playerRef.current.seekTo(newTime);
+          safeSeekTo(newTime);
         };
 
         if (isDoubleTap) {
@@ -356,24 +565,42 @@ export default function App() {
           arrowTimer.current[key] = setTimeout(() => {
             performSkip(skipIntervals.single);
             arrowTimer.current[key] = null;
-          }, 350); // Increased delay for better double-tap detection
+          }, 250); // Reduced delay as requested
         }
       }
 
       if (e.key.toLowerCase() === 'k') {
-        setState(prev => ({ 
-          ...prev, 
-          cycleStart: prev.currentTime,
-          isLooping: prev.cycleEnd !== null
-        }));
+        setState(prev => {
+          const t = prev.currentTime;
+          let start = t;
+          let end = prev.cycleEnd;
+          if (end !== null && start > end) {
+            [start, end] = [end, start];
+          }
+          return { 
+            ...prev, 
+            cycleStart: start,
+            cycleEnd: end,
+            isLooping: end !== null
+          };
+        });
       }
 
       if (e.key.toLowerCase() === 'l') {
-        setState(prev => ({ 
-          ...prev, 
-          cycleEnd: prev.currentTime, 
-          isLooping: prev.cycleStart !== null 
-        }));
+        setState(prev => {
+          const t = prev.currentTime;
+          let start = prev.cycleStart;
+          let end = t;
+          if (start !== null && end < start) {
+            [start, end] = [end, start];
+          }
+          return { 
+            ...prev, 
+            cycleStart: start,
+            cycleEnd: end,
+            isLooping: start !== null 
+          };
+        });
       }
 
       if (e.code === 'Escape') {
@@ -441,8 +668,7 @@ export default function App() {
           }
           const nextTime = Math.max(lowerBound, time);
           newState.currentTime = nextTime;
-          if (wavesurferRef.current) wavesurferRef.current.setTime(nextTime);
-          if (playerRef.current) playerRef.current.seekTo(nextTime);
+          safeSeekTo(nextTime);
         }
         return newState;
       });
@@ -461,8 +687,7 @@ export default function App() {
               // Revert to last valid cycle if it exists
               if (lastValidCycle.current) {
                 const { start: oldStart, end: oldEnd, isLooping: oldIsLooping } = lastValidCycle.current;
-                if (wavesurferRef.current && oldStart !== null) wavesurferRef.current.setTime(oldStart);
-                if (playerRef.current && oldStart !== null) playerRef.current.seekTo(oldStart);
+                if (oldStart !== null) safeSeekTo(oldStart);
                 return {
                   ...prev,
                   cycleStart: oldStart,
@@ -479,8 +704,7 @@ export default function App() {
               };
             }
 
-            if (wavesurferRef.current) wavesurferRef.current.setTime(start);
-            if (playerRef.current) playerRef.current.seekTo(start);
+            safeSeekTo(start);
             return { 
               ...prev, 
               cycleStart: start,
@@ -540,8 +764,7 @@ export default function App() {
         }
 
         // Seek to start of cycle
-        if (wavesurferRef.current) wavesurferRef.current.setTime(start);
-        if (playerRef.current) playerRef.current.seekTo(start);
+        safeSeekTo(start);
 
         return {
           ...prev,
@@ -561,7 +784,7 @@ export default function App() {
     };
   }, [isSelectingCycle, state.duration]);
 
-  // Sync state with WaveSurfer, ReactPlayer, and Tone.js
+  // Sync state with WaveSurfer, YouTube Player, and Tone.js
   useEffect(() => {
     if (wavesurferRef.current) {
       if (state.isPlaying) {
@@ -746,34 +969,80 @@ export default function App() {
             >
               <div className="aspect-video bg-black rounded-3xl overflow-hidden shadow-2xl border border-white/10">
                 {state.mediaType === 'youtube' ? (
-                  <Player
-                    ref={playerRef}
-                    url={state.mediaUrl}
-                    width="100%"
-                    height="100%"
-                    playing={state.isPlaying}
-                    playbackRate={state.playbackRate}
-                    volume={state.volume}
-                    onProgress={(p: any) => setState(prev => ({ ...prev, currentTime: p.playedSeconds }))}
-                    onReady={(player: any) => {
-                      const d = player.getDuration();
-                      setState(prev => ({ ...prev, duration: d, clipEnd: prev.clipEnd === null ? d : prev.clipEnd }));
-                    }}
-                  />
+                  <div className="relative w-full h-full">
+                    <div 
+                      ref={youtubeContainerRef} 
+                      className="w-full h-full"
+                    />
+                    {(!state.isReady || state.isBuffering) && (
+                      <div className="absolute inset-0 flex items-center justify-center bg-black/40 backdrop-blur-sm z-10 pointer-events-none">
+                        <div className="flex flex-col items-center gap-3">
+                          <div className="w-10 h-10 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin" />
+                          <span className="text-white text-sm font-medium tracking-wider">
+                            {!state.isReady ? 'LOADING YOUTUBE...' : 'BUFFERING'}
+                          </span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 ) : state.mediaType === 'video' ? (
-                  <video 
-                    ref={videoRef}
-                    src={state.mediaUrl} 
-                    className="w-full h-full"
-                    onTimeUpdate={(e) => {
-                      const currentTime = e.currentTarget.currentTime;
-                      setState(prev => ({ ...prev, currentTime }));
-                    }}
-                    onLoadedMetadata={(e) => {
-                      const duration = e.currentTarget.duration;
-                      setState(prev => ({ ...prev, duration, clipEnd: prev.clipEnd === null ? duration : prev.clipEnd }));
-                    }}
-                  />
+                  <div className="relative w-full h-full">
+                    <video 
+                      ref={videoRef}
+                      className="w-full h-full"
+                      playsInline
+                      onTimeUpdate={(e) => {
+                        const currentTime = e.currentTarget.currentTime;
+                        setState(prev => ({ ...prev, currentTime }));
+                        checkLoop(currentTime);
+                      }}
+                      onLoadedMetadata={(e) => {
+                        const duration = e.currentTarget.duration;
+                        console.log('Video: Metadata loaded', { duration });
+                        setState(prev => ({ 
+                          ...prev, 
+                          duration, 
+                          clipEnd: prev.clipEnd === null ? duration : prev.clipEnd,
+                          isReady: true 
+                        }));
+                      }}
+                      onWaiting={() => {
+                        console.log('Video: Waiting (buffering)...');
+                        setState(prev => ({ ...prev, isBuffering: true }));
+                      }}
+                      onPlaying={() => {
+                        console.log('Video: Playing');
+                        setState(prev => ({ ...prev, isBuffering: false, isPlaying: true }));
+                      }}
+                      onPause={() => {
+                        console.log('Video: Paused');
+                        if (!isProgrammaticPause.current) {
+                          setState(prev => ({ ...prev, isPlaying: false }));
+                        }
+                      }}
+                      onSeeked={() => {
+                        setState(prev => ({ ...prev, isBuffering: false }));
+                      }}
+                      onCanPlay={() => {
+                        setState(prev => ({ ...prev, isBuffering: false }));
+                      }}
+                      onError={(e) => {
+                        // Suppress aborted errors
+                        const err = (e.target as HTMLVideoElement).error;
+                        if (err?.code === 4 || err?.message?.includes('aborted')) return;
+                        console.error('Video element error:', e);
+                        setState(prev => ({ ...prev, isBuffering: false, isReady: false }));
+                      }}
+                    />
+                    {state.isBuffering && (
+                      <div className="absolute inset-0 flex items-center justify-center bg-black/40 backdrop-blur-sm z-10">
+                        <div className="flex flex-col items-center gap-3">
+                          <div className="w-10 h-10 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin" />
+                          <span className="text-white text-sm font-medium tracking-wider">BUFFERING</span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 ) : (
                   <div className="w-full h-full flex flex-col items-center justify-center bg-gradient-to-br from-indigo-900/20 to-black">
                     <div className="relative">
@@ -803,8 +1072,7 @@ export default function App() {
                       lowerBound = Math.max(lowerBound, state.cycleStart);
                     }
                     const newTime = Math.max(lowerBound, state.currentTime - skipIntervals.single);
-                    if (wavesurferRef.current) wavesurferRef.current.setTime(newTime);
-                    if (playerRef.current) playerRef.current.seekTo(newTime);
+                    safeSeekTo(newTime);
                   }} 
                   className="p-3 hover:bg-white/10 rounded-full transition-all hover:scale-110 text-white/80 pointer-events-auto"
                 >
@@ -820,8 +1088,7 @@ export default function App() {
                       // If starting playback and playhead is before cycle start, jump to cycle start
                       if (isStarting && prev.isLooping && prev.cycleStart !== null && prev.currentTime < prev.cycleStart) {
                         nextTime = prev.cycleStart;
-                        if (wavesurferRef.current) wavesurferRef.current.setTime(nextTime);
-                        if (playerRef.current) playerRef.current.seekTo(nextTime);
+                        safeSeekTo(nextTime);
                       }
                       
                       return { ...prev, isPlaying: isStarting, currentTime: nextTime };
@@ -835,8 +1102,7 @@ export default function App() {
                   onClick={(e) => {
                     e.stopPropagation();
                     const newTime = state.currentTime + skipIntervals.single;
-                    if (wavesurferRef.current) wavesurferRef.current.setTime(newTime);
-                    if (playerRef.current) playerRef.current.seekTo(newTime);
+                    safeSeekTo(newTime);
                   }} 
                   className="p-3 hover:bg-white/10 rounded-full transition-all hover:scale-110 text-white/80 pointer-events-auto"
                 >
@@ -850,7 +1116,17 @@ export default function App() {
               {/* Timeline Area */}
               <div id="timeline-area" className="p-4 pb-0 space-y-1">
                 <div className="flex items-center justify-between text-[10px] font-mono text-white/40 px-1">
-                  <span>{formatTime(state.currentTime)}</span>
+                  <div className="flex items-center gap-2">
+                    <span>{formatTime(state.currentTime)}</span>
+                    <button 
+                      onClick={() => setState(prev => ({ ...prev, clipStart: 0, clipEnd: state.duration }))}
+                      className="p-1 hover:bg-indigo-500/10 hover:text-indigo-400 rounded transition-all flex items-center gap-1 group/reset"
+                      title="Reset Clip"
+                    >
+                      <RotateCcw size={10} className="group-hover/reset:rotate-[-45deg] transition-transform" />
+                      <span className="text-[8px] opacity-0 group-hover/reset:opacity-100 transition-opacity">RESET</span>
+                    </button>
+                  </div>
                   <div className="flex gap-4">
                     {state.cycleStart !== null && <span className="text-amber-400">Cycle: {formatTime(state.cycleStart)} - {state.cycleEnd !== null ? formatTime(state.cycleEnd) : '...'}</span>}
                     <div className="flex gap-3">
@@ -920,8 +1196,7 @@ export default function App() {
                       }
                       time = Math.max(lowerBound, time);
                       
-                      if (wavesurferRef.current) wavesurferRef.current.setTime(time);
-                      if (playerRef.current) playerRef.current.seekTo(time);
+                      safeSeekTo(time);
                       setState(prev => ({ ...prev, currentTime: time }));
                     }
                     mouseDownRef.current = null;
@@ -937,7 +1212,7 @@ export default function App() {
                         )} 
                       />
                       {state.mediaType === 'youtube' && (
-                        <div className="absolute inset-0 flex items-center px-4">
+                        <div className="absolute inset-0 flex items-center">
                           <div className="w-full h-1.5 bg-white/10 rounded-full overflow-hidden">
                             <div 
                               className="h-full bg-indigo-500 transition-all duration-100" 
@@ -1056,8 +1331,7 @@ export default function App() {
                             lowerBound = Math.max(lowerBound, state.cycleStart);
                           }
                           const newTime = Math.max(lowerBound, state.currentTime - skipIntervals.single);
-                          if (wavesurferRef.current) wavesurferRef.current.setTime(newTime);
-                          if (playerRef.current) playerRef.current.seekTo(newTime);
+                          safeSeekTo(newTime);
                         }}
                         className="p-2 hover:bg-white/10 rounded-lg text-white/60 hover:text-white transition-all"
                         title={`Skip Back ${skipIntervals.single}s`}
@@ -1133,8 +1407,7 @@ export default function App() {
                     <button 
                       onClick={() => {
                         const newTime = Math.min(state.clipEnd || state.duration, state.currentTime + skipIntervals.single);
-                        if (wavesurferRef.current) wavesurferRef.current.setTime(newTime);
-                        if (playerRef.current) playerRef.current.seekTo(newTime);
+                        safeSeekTo(newTime);
                       }}
                       className="p-2 hover:bg-white/10 rounded-lg text-white/60 hover:text-white transition-all"
                       title={`Skip Forward ${skipIntervals.single}s`}
@@ -1155,8 +1428,7 @@ export default function App() {
                         }
                         if (prev.currentTime < lowerBound) {
                           nextTime = lowerBound;
-                          if (wavesurferRef.current) wavesurferRef.current.setTime(nextTime);
-                          if (playerRef.current) playerRef.current.seekTo(nextTime);
+                          safeSeekTo(nextTime);
                         }
                       }
                       
@@ -1232,14 +1504,6 @@ export default function App() {
                       title="Clear Cycle"
                     >
                       <Trash2 size={18} />
-                    </button>
-
-                    <button 
-                      onClick={() => setState(prev => ({ ...prev, clipStart: 0, clipEnd: state.duration }))}
-                      className="p-2 text-white/40 hover:bg-indigo-500/10 hover:text-indigo-400 rounded-lg transition-all"
-                      title="Reset Clip"
-                    >
-                      <RotateCcw size={18} />
                     </button>
                   </div>
 
@@ -1354,6 +1618,39 @@ export default function App() {
                                 />
                               </div>
                             </div>
+
+                            {/* Loop Delay */}
+                            <div className="space-y-3">
+                              <h4 className="text-[10px] font-bold text-white/40 uppercase tracking-widest">Loop Delay</h4>
+                              <div className="flex bg-black rounded-lg p-1 border border-white/10">
+                                {[0, 1, 2, 3, 5].map(v => (
+                                  <button 
+                                    key={v}
+                                    onClick={() => setState(prev => ({ ...prev, loopDelay: v }))}
+                                    className={cn(
+                                      "flex-1 py-1 text-[10px] rounded-md transition-colors",
+                                      state.loopDelay === v ? "bg-indigo-600 text-white" : "hover:bg-white/5 text-white/40"
+                                    )}
+                                  >
+                                    {v}s
+                                  </button>
+                                ))}
+                              </div>
+                              <div className="p-1 border-t border-white/5 mt-1">
+                                <input 
+                                  type="text"
+                                  inputMode="decimal"
+                                  className="w-full bg-black/40 border border-white/10 rounded px-1 py-1 text-[10px] font-mono text-center focus:border-indigo-500 outline-none text-white placeholder-white/20"
+                                  placeholder="Custom (s)"
+                                  value={state.loopDelay === 0 ? '' : state.loopDelay}
+                                  onChange={(e) => {
+                                    const val = e.target.value.replace(/[^0-9.]/g, '');
+                                    setState(prev => ({ ...prev, loopDelay: parseFloat(val) || 0 }));
+                                  }}
+                                  onClick={(e) => e.stopPropagation()}
+                                />
+                              </div>
+                            </div>
                           </motion.div>
                         </>
                       )}
@@ -1400,10 +1697,11 @@ export default function App() {
                 <ShortcutItem keys={['←', '→']} desc={`Skip ${skipIntervals.single}s (Double Tap ${skipIntervals.double}s)`} />
                 <ShortcutItem keys={['K']} desc="Set Cycle Start" />
                 <ShortcutItem keys={['L']} desc="Set Cycle End" />
-                <ShortcutItem keys={['Esc']} desc="Clear State / Speed" />
+                <ShortcutItem keys={['Esc']} desc="Clear Loop/Speed/Clip Edit" />
                 <ShortcutItem keys={['Hold Space']} desc="Fast Forward (2x)" />
                 <ShortcutItem keys={['Double Space']} desc="Lock Fast Forward" />
                 <ShortcutItem keys={['Shift', 'Space']} desc="Slow Motion (0.5x)" />
+                <ShortcutItem keys={['Shift', 'Double Space']} desc="Lock Slow Motion" />
               </div>
             </motion.div>
           </div>
